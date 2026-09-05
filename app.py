@@ -3,6 +3,7 @@ import streamlit as st
 import time
 import math
 import re
+import html
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -59,72 +60,60 @@ def get_driver():
     return webdriver.Chrome(options=options)
 
 def parse_all_with_scroll(driver, calc_mode, exclude_ceo):
+    """표의 실제 열 구조를 기준으로 라벨, 멤버 이름, 점수를 읽는다."""
     try:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.3)
-    except:
+        time.sleep(0.1)
+    except Exception:
         pass
 
     try:
         raw_rows_data = driver.execute_script("""
-            let rows = document.querySelectorAll('tr, div[class*="row"], div[class*="item"], div[class*="list"]');
-            let results = [];
-            rows.forEach(r => {
-                let text = r.innerText.trim();
-                if (text) { results.push(text); }
-            });
-            return results;
+            return Array.from(document.querySelectorAll('table tbody tr')).map(row =>
+                Array.from(row.querySelectorAll(':scope > td')).map(cell =>
+                    (cell.innerText || '').replace(/\\s+/g, ' ').trim()
+                )
+            );
         """)
     except Exception:
         raw_rows_data = []
 
     people = []
-    job_titles = ["대표", "사장", "부장", "차장", "과장", "팀장", "비서", "대리", "주임", "사원", "청소부", "이사", "부팀장", "썹청소부", "썯청소부", "인턴", "회장", "매니저", "사원1", "사원2", "청소부1", "청소부2", "청소부3"]
-
-    for line in raw_rows_data:
+    for cells in raw_rows_data:
         try:
-            full_line = line.replace('\n', ' ').strip()
-            if not full_line: continue
-            if any(kw in full_line for kw in ["스트리머", "기여도", "웹후원", "계좌후원", "점수", "순위", "직급", "NOTICE", "공지"]): continue
-            if "조퇴" in full_line: continue
-            if exclude_ceo and ("대표" in full_line or "사장" in full_line or "류도현" in full_line): continue
+            # 직급/라벨, 스트리머, 웹후원, 계좌후원, 점수, 기여도
+            if len(cells) < 6:
+                continue
 
-            tokens = [t for t in full_line.split() if t]
-            if len(tokens) < 2: continue
+            label = cells[0].strip()
+            streamer_cell = cells[1].strip()
+            if not streamer_cell or streamer_cell == "총 합":
+                continue
 
-            name = ""
-            for tk_val in tokens:
-                clean_tk = tk_val.strip()
-                if clean_tk.isdigit(): continue
-                if clean_tk in job_titles or any(jt in clean_tk for jt in job_titles): continue
-                if re.search(r'[\d.,()]', clean_tk): continue
-                if len(clean_tk) > 12 or len(clean_tk) < 1: continue
-                name = clean_tk
-                break
+            # 대표 행만 제외한다. 부장/인턴 같은 사무직 직급은 이름 셀에
+            # 포함되어 있으므로 목록으로 추측하지 않고 마지막 토큰을 이름으로 쓴다.
+            if exclude_ceo and label == "대표":
+                continue
 
-            nums = []
-            for tk_val in tokens:
-                clean_t = re.sub(r'\(.*?\)', '', tk_val).replace(',', '').strip()
-                try:
-                    val = float(clean_t)
-                    nums.append(val)
-                except ValueError:
-                    pass
+            name_tokens = streamer_cell.split()
+            if not name_tokens:
+                continue
+            name = name_tokens[-1]
 
-            if not nums or not name: continue
-            target_value = nums[-1] if calc_mode == "contrib" else (nums[-2] if len(nums) >= 2 else nums[0])
+            score_index = 5 if calc_mode == "contrib" else 4
+            score_text = cells[score_index].replace(",", "").strip()
+            score = float(score_text)
 
-            if name and name not in ["직급", "스트리머", "웹후원", "계좌후원", "점수", "기여도", "대표", "사장"]:
-                people.append({'name': name, 'score': target_value})
-        except Exception:
+            people.append({"name": name, "label": label, "score": score})
+        except (ValueError, TypeError, IndexError):
             continue
 
     unique_people = []
     seen = set()
-    for p in people:
-        if p['name'] not in seen:
-            seen.add(p['name'])
-            unique_people.append(p)
+    for person in people:
+        if person["name"] not in seen:
+            seen.add(person["name"])
+            unique_people.append(person)
 
     return unique_people
 
@@ -144,7 +133,13 @@ with st.expander("⚙️ 설정 및 필터 옵션 (클릭해서 열기/닫기)",
     with col_2:
         diff_limit = st.number_input("점수 차이 기준 (점 이하)", value=50, step=5)
         max_display = st.number_input("최대 표시 개수 (0은 제한 없음)", value=0, step=1)
-        interval = st.number_input("자동 갱신 주기 (초)", value=5, min_value=1, step=1)
+        interval = st.number_input(
+            "자동 갱신 주기 (초)",
+            value=1.0,
+            min_value=0.1,
+            step=0.1,
+            format="%.1f",
+        )
         
     with col_3:
         st.write("### 예외 처리 및 표시 설정")
@@ -220,11 +215,15 @@ def live_tracker():
                 if output_items:
                     for item in output_items:
                         if show_scores:
-                            p1_str = f"{item['p1']['name']} <span style='color: #6b7280; font-size: 15px;'>({item['p1']['score']:,.1f})</span>"
-                            p2_str = f"{item['p2']['name']} <span style='color: #6b7280; font-size: 15px;'>({item['p2']['score']:,.1f})</span>"
+                            p1_name = html.escape(item["p1"]["name"])
+                            p2_name = html.escape(item["p2"]["name"])
+                            p1_label = html.escape(item["p1"]["label"])
+                            p2_label = html.escape(item["p2"]["label"])
+                            p1_str = f"{p1_name} <span style='color: #4f46e5; font-size: 14px;'>[{p1_label}]</span> <span style='color: #6b7280; font-size: 15px;'>({item['p1']['score']:,.1f})</span>"
+                            p2_str = f"{p2_name} <span style='color: #4f46e5; font-size: 14px;'>[{p2_label}]</span> <span style='color: #6b7280; font-size: 15px;'>({item['p2']['score']:,.1f})</span>"
                         else:
-                            p1_str = f"{item['p1']['name']}"
-                            p2_str = f"{item['p2']['name']}"
+                            p1_str = f'{html.escape(item["p1"]["name"])} <span style="color: #4f46e5; font-size: 14px;">[{html.escape(item["p1"]["label"])}]</span>'
+                            p2_str = f'{html.escape(item["p2"]["name"])} <span style="color: #4f46e5; font-size: 14px;">[{html.escape(item["p2"]["label"])}]</span>'
                             
                         cards_html += f"""
                         <div class="result-card">
